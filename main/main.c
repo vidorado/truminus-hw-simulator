@@ -39,7 +39,7 @@ static const uint8_t s_aes_key[16] = {
     0x00,0x11,0x22,0x33, 0x44,0x55,0x66,0x77,
     0x88,0x99,0xAA,0xBB, 0xCC,0xDD,0xEE,0xFF,
 };
-#define DEVICE_NAME "TruSim-BLE"
+#define DEVICE_NAME "TruMinus-BLESim"
 
 // ── State ────────────────────────────────────────────────────────────────
 static uint8_t  s_own_addr_type;
@@ -98,35 +98,36 @@ static int build_victron_mfr(uint8_t* out /*26 bytes*/) {
 }
 
 // ── Adv / scan-rsp data ──────────────────────────────────────────────────
-// Match real Victron: flags + name + service UUID in ADV_IND;
-// encrypted manufacturer payload (marker 0x10) in SCAN_RSP.
+// Put the Victron manufacturer payload in ADV_IND so passive scanners
+// (and the P4 parser) see it directly. Name + Ultimatron service UUID
+// go in the SCAN_RSP.
 static void update_adv_data(void) {
+    uint8_t mfr[26];
+    build_victron_mfr(mfr);
     uint8_t adv[31];
     int p = 0;
     adv[p++] = 2;
     adv[p++] = 0x01;
     adv[p++] = 0x06;                       // LE general disc | BR/EDR not supported
-    adv[p++] = 3;
-    adv[p++] = 0x03;                       // complete list of 16-bit UUIDs
-    adv[p++] = 0x00; adv[p++] = 0xFF;      // 0xFF00 (Ultimatron service)
-    const char* name = DEVICE_NAME;
-    int nlen = (int)strlen(name);
-    if (nlen > 20) nlen = 20;
-    adv[p++] = 1 + nlen;
-    adv[p++] = 0x09;                       // complete local name
-    memcpy(adv + p, name, nlen); p += nlen;
+    adv[p++] = 1 + 26;
+    adv[p++] = 0xFF;                       // manufacturer specific
+    memcpy(adv + p, mfr, 26); p += 26;
     int rc = ble_gap_adv_set_data(adv, p);
     if (rc) ESP_LOGW(TAG, "adv_set_data rc=%d", rc);
 }
 
 static void update_scan_rsp(void) {
-    uint8_t mfr[26];
-    build_victron_mfr(mfr);
     uint8_t sr[31];
     int p = 0;
-    sr[p++] = 1 + 26;
-    sr[p++] = 0xFF;                        // manufacturer specific
-    memcpy(sr + p, mfr, 26); p += 26;
+    sr[p++] = 3;
+    sr[p++] = 0x03;                        // complete list of 16-bit UUIDs
+    sr[p++] = 0x00; sr[p++] = 0xFF;        // 0xFF00 (Ultimatron service)
+    const char* name = DEVICE_NAME;
+    int nlen = (int)strlen(name);
+    if (nlen > 24) nlen = 24;
+    sr[p++] = 1 + nlen;
+    sr[p++] = 0x09;                        // complete local name
+    memcpy(sr + p, name, nlen); p += nlen;
     int rc = ble_gap_adv_rsp_set_data(sr, p);
     if (rc) ESP_LOGW(TAG, "adv_rsp_set_data rc=%d", rc);
 }
@@ -276,7 +277,7 @@ static void updater_task(void* arg) {
             s_kWhToday =   1.0f + (t / 3600.0f);
         }
         if (s_conn_handle == BLE_HS_CONN_HANDLE_NONE) {
-            update_scan_rsp();
+            update_adv_data();
         }
         vTaskDelay(pdMS_TO_TICKS(2000));
     }
