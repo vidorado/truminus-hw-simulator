@@ -32,6 +32,12 @@
 #include <stdlib.h>
 #include <ctype.h>
 
+#include "truma_sim.h"
+
+// LIN pins to the Truma consumer board (TTL direct, no transceiver).
+#define TRUMA_LIN_TX_GPIO  21
+#define TRUMA_LIN_RX_GPIO  20
+
 static const char* TAG = "blesim";
 
 // ── Configuration (match P4 NVS) ─────────────────────────────────────────
@@ -55,6 +61,8 @@ static volatile float   s_kWhToday  =   1.25f;
 static volatile uint8_t s_state     = 3;
 static volatile uint8_t s_soc       = 75;     // BMS SOC %
 static volatile float   s_tempC     = 20.0f;  // BMS NTC1
+static volatile uint8_t s_tankPct   = 60;     // BTHome tank level %, 0..100
+static volatile uint8_t s_tankSeq   = 0;      // BTHome packet-id (dedup)
 static volatile bool    s_autocycle = true;   // sinf() updater on/off
 
 static void advertise(void);
@@ -130,6 +138,39 @@ static void update_scan_rsp(void) {
     memcpy(sr + p, name, nlen); p += nlen;
     int rc = ble_gap_adv_rsp_set_data(sr, p);
     if (rc) ESP_LOGW(TAG, "adv_rsp_set_data rc=%d", rc);
+}
+
+// BTHome v2 unencrypted service-data (UUID 0xFCD2).
+// Layout in adv:
+//   AD: 02 01 06                              Flags
+//   AD: 03 03 D2 FC                           Complete list of 16-bit UUIDs (BTHome)
+//   AD: 08 16 D2 FC 40 00 <seq> 2F <pct>      Service Data:
+//        - UUID 0xFCD2 (BTHome) little-endian
+//        - Device info 0x40 = v2, unencrypted, no trigger
+//        - Tag 0x00 (Packet ID, uint8) + seq
+//        - Tag 0x2F (Moisture, uint8 0..100%) + pct  ← tank level
+// Total 16 bytes, well below the 31-byte legacy adv limit.
+static void update_adv_data_bthome(void) {
+    uint8_t adv[31];
+    int p = 0;
+    // Flags
+    adv[p++] = 2;
+    adv[p++] = 0x01;
+    adv[p++] = 0x06;
+    // 16-bit Service UUID list (helps generic BLE scanners — incl. HA — pick
+    // the device up without having to parse Service Data first).
+    adv[p++] = 3;
+    adv[p++] = 0x03;
+    adv[p++] = 0xD2; adv[p++] = 0xFC;
+    // Service Data — BTHome v2 unencrypted
+    adv[p++] = 8;
+    adv[p++] = 0x16;
+    adv[p++] = 0xD2; adv[p++] = 0xFC;          // UUID 0xFCD2 LE
+    adv[p++] = 0x40;                            // device info: v2, unencrypted
+    adv[p++] = 0x00; adv[p++] = s_tankSeq;     // packet ID tag + value
+    adv[p++] = 0x2F; adv[p++] = s_tankPct;     // moisture (uint8 0..100%)
+    int rc = ble_gap_adv_set_data(adv, p);
+    if (rc) ESP_LOGW(TAG, "adv_set_data (bthome) rc=%d", rc);
 }
 
 // ── GATT 0xFF00 / FF01 (notify) / FF02 (write) ───────────────────────────
@@ -266,8 +307,13 @@ static void on_reset(int reason) {
 }
 
 // ── Value updater ────────────────────────────────────────────────────────
+// Alternates the legacy adv payload between Victron mfr-data and BTHome
+// service-data every 2 s.  Both share the same SCAN_RSP (name + 0xFF00
+// Ultimatron service), so the device's identity stays constant.  In a 5 s
+// P4 scan window each payload is always present at least once.
 static void updater_task(void* arg) {
     (void)arg;
+    bool bthome_turn = false;
     while (1) {
         if (s_autocycle) {
             float t = (float)(esp_timer_get_time() / 1000000ULL);
@@ -275,9 +321,21 @@ static void updater_task(void* arg) {
             s_battA    =  4.0f  + 3.0f  * sinf(t * 0.4f);
             s_pvW      = 100.0f + 60.0f * sinf(t * 0.7f);
             s_kWhToday =   1.0f + (t / 3600.0f);
+            // Tank level: oscillates 25..95 % over ~10 min so the P4 sees
+            // visible changes without flooding the WS broadcast diff filter.
+            float pctF = 60.0f + 35.0f * sinf(t * 0.01f);
+            if (pctF < 0.0f)   pctF = 0.0f;
+            if (pctF > 100.0f) pctF = 100.0f;
+            s_tankPct = (uint8_t)lroundf(pctF);
         }
         if (s_conn_handle == BLE_HS_CONN_HANDLE_NONE) {
-            update_adv_data();
+            if (bthome_turn) {
+                s_tankSeq++;          // bump BTHome packet ID each emission
+                update_adv_data_bthome();
+            } else {
+                update_adv_data();
+            }
+            bthome_turn = !bthome_turn;
         }
         vTaskDelay(pdMS_TO_TICKS(2000));
     }
@@ -285,9 +343,9 @@ static void updater_task(void* arg) {
 
 // ── Serial REPL over USB-CDC ─────────────────────────────────────────────
 static void print_status(void) {
-    printf("V=%.2f A=%.2f W=%.1f kWh=%.3f state=%u SOC=%u T=%.1f auto=%s\r\n",
+    printf("V=%.2f A=%.2f W=%.1f kWh=%.3f state=%u SOC=%u T=%.1f tank=%u%% auto=%s\r\n",
            s_battV, s_battA, s_pvW, s_kWhToday,
-           (unsigned)s_state, (unsigned)s_soc, s_tempC,
+           (unsigned)s_state, (unsigned)s_soc, s_tempC, (unsigned)s_tankPct,
            s_autocycle ? "on" : "off");
 }
 
@@ -300,11 +358,25 @@ static void handle_line(char* line) {
     for (char* p = cmd; *p; p++) *p = (char)tolower((unsigned char)*p);
 
     if (strcmp(cmd, "?") == 0 || strcmp(cmd, "help") == 0) {
-        printf("commands: v <V> | a <A> | p <W> | k <kWh> | s <state>"
-               " | soc <%%> | t <degC> | auto on|off | ? | status\r\n");
+        printf("solar/bms: v <V> | a <A> | p <W> | k <kWh> | s <state>"
+               " | soc <%%> | t <degC> | auto on|off | status\r\n");
+        printf("truma:     troom <C> | twater <C> | tburn 0|1 |"
+               " terr <class> [code [short]] | tstatus\r\n");
+        printf("tank:      tank <pct 0..100>     (BTHome moisture adv)\r\n");
         return;
     }
-    if (strcmp(cmd, "status") == 0) { print_status(); return; }
+    if (strcmp(cmd, "status") == 0)  { print_status(); return; }
+    if (strcmp(cmd, "tstatus") == 0) { truma_sim_print_status(); return; }
+    if (strcmp(cmd, "tping") == 0)   { truma_sim_ping(); printf("tx 0x21\r\n"); return; }
+    if (strcmp(cmd, "ttoggle") == 0) {
+        // Drive TRUMA_LIN_TX_GPIO as plain GPIO @ ~1 kHz for 2 s to
+        // verify rail-to-rail swing on the scope without UART involved.
+        // Note: temporarily detaches the UART driver from the pin.
+        extern void truma_sim_ttoggle(int gpio, int ms);
+        truma_sim_ttoggle(TRUMA_LIN_TX_GPIO, 2000);
+        printf("toggled GPIO%d for 2 s\r\n", TRUMA_LIN_TX_GPIO);
+        return;
+    }
     if (strcmp(cmd, "auto") == 0) {
         if (!arg) { printf("auto=%s\r\n", s_autocycle ? "on" : "off"); return; }
         s_autocycle = (strcmp(arg, "on") == 0 || strcmp(arg, "1") == 0);
@@ -320,6 +392,40 @@ static void handle_line(char* line) {
     else if (strcmp(cmd, "s") == 0)   s_state    = (uint8_t)strtol(arg, NULL, 0);
     else if (strcmp(cmd, "soc") == 0) s_soc      = (uint8_t)strtol(arg, NULL, 0);
     else if (strcmp(cmd, "t") == 0)   s_tempC    = strtof(arg, NULL);
+    else if (strcmp(cmd, "tank") == 0) {
+        long v = strtol(arg, NULL, 0);
+        if (v < 0)   v = 0;
+        if (v > 100) v = 100;
+        s_tankPct = (uint8_t)v;
+        s_autocycle = false;          // freeze the sinusoid so the value sticks
+        printf("tank=%u%% (autocycle off)\r\n", (unsigned)s_tankPct);
+        return;
+    }
+    else if (strcmp(cmd, "troom") == 0) {
+        truma_sim_set_room_temp(strtof(arg, NULL));
+        truma_sim_print_status();
+        return;
+    }
+    else if (strcmp(cmd, "twater") == 0) {
+        truma_sim_set_water_temp(strtof(arg, NULL));
+        truma_sim_print_status();
+        return;
+    }
+    else if (strcmp(cmd, "tburn") == 0) {
+        truma_sim_set_burner(strtol(arg, NULL, 0) != 0);
+        truma_sim_print_status();
+        return;
+    }
+    else if (strcmp(cmd, "terr") == 0) {
+        char* a2 = strtok(NULL, " \t");
+        char* a3 = strtok(NULL, " \t");
+        uint8_t k = (uint8_t)strtol(arg, NULL, 0);
+        uint8_t c = a2 ? (uint8_t)strtol(a2, NULL, 0) : 0;
+        uint8_t s = a3 ? (uint8_t)strtol(a3, NULL, 0) : 0;
+        truma_sim_set_error(k, c, s);
+        truma_sim_print_status();
+        return;
+    }
     else { printf("unknown: %s (try '?')\r\n", cmd); return; }
     print_status();
 }
@@ -386,4 +492,6 @@ void app_main(void) {
     nimble_port_freertos_init(ble_host_task);
     xTaskCreate(updater_task, "upd", 4096, NULL, 2, NULL);
     xTaskCreate(console_task, "con", 4096, NULL, 3, NULL);
+
+    truma_sim_init(TRUMA_LIN_TX_GPIO, TRUMA_LIN_RX_GPIO);
 }
