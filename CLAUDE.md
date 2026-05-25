@@ -60,14 +60,68 @@ clean tree.
 
 ## Source layout
 
-- `main/main.c` — everything: NimBLE init, GAP/GATT, AES-CTR encryption
-  of the Victron payload, GATT service definition, value updater task.
-  ~250 lines, single file.
-- `main/CMakeLists.txt` — registers `main.c`; requires `nvs_flash bt
-  esp_timer mbedtls`.
+- `main/main.c` — NimBLE init, GAP/GATT, AES-CTR encryption of the
+  Victron payload, GATT service definition, value updater task, USB-CDC
+  REPL. Calls `truma_sim_init()` at the end of `app_main`.
+- `main/truma_sim.[ch]` — Truma Combi D LIN slave simulator on UART1.
+  TX=GPIO20, RX=GPIO21, 9600 8N1, TTL-direct (no LIN transceiver).
+  Publishes frames 0x21 (room/water temperatures) and 0x22 (burner
+  state); accepts master writes on 0x20 and answers 0x3C/0x3D
+  diagnostic transport for TOnOff (SID 0xB8) and TGetErrorInfo
+  (SID 0xB2). See `.claude/skills/truma-protocol/SKILL.md` for the
+  byte layout.
+- `main/CMakeLists.txt` — registers `main.c` + `truma_sim.c`; requires
+  `nvs_flash bt esp_timer mbedtls esp_driver_usb_serial_jtag
+  esp_driver_uart`.
 - `CMakeLists.txt` — top-level IDF project.
 - `sdkconfig.defaults` — `IDF_TARGET=esp32c3`, NimBLE peripheral-only,
   max 1 connection.
+
+## Truma LIN simulator — wiring & gotchas
+
+Hard-won lessons from getting the C3 to actually talk to a real CYD-C5
+running the TruMinus firmware over TTL UART (no LIN transceiver):
+
+- **Pins**: TX=GPIO21, RX=GPIO20. GPIO20/21 are the C3's default UART0
+  pins. The IDF console MUST be moved to USB-CDC only
+  (`CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y`, `CONFIG_ESP_CONSOLE_UART_NUM=-1`)
+  or UART0 will keep driving GPIO21 and silently steal our TX line.
+  `gpio_reset_pin()` alone is **not** enough — the IDF console
+  reattaches the IO_MUX on every `ESP_LOGI()`.
+- **Baud is 9600**, not the 19200 that `Lin_Interface.hpp` defaults to.
+  `main.cpp` of the TruMinus C5 overrides it via `LinBus.baud = 9600;`.
+  The BREAK byte is sent at half-baud (4800) inside an otherwise 9600
+  stream — on the scope it looks like "a pulse twice as wide", which
+  is a misleading sign that the C5 runs at 19200. It does not.
+- **Slave responses must include a `0x00 0x55 PID` prefix** before the
+  data + checksum. The C5's `Lin_Interface::readFrame()` state machine
+  expects to see those three bytes in its RX before storing data. On a
+  real LIN bus they appear naturally as the master's TX echo (single
+  wire). With separate TX/RX wires the prefix has to be faked by us.
+  Implemented in `send_frame()` in `truma_sim.c`.
+- **1 kΩ pull-down on our TX (GPIO21 → GND)** is required. The C5's RX
+  pin has an internal pull-up (~30 kΩ to 3.3 V) enabled implicitly by
+  `Serial1.begin()` / `uart_set_pin()` in IDF. Our push-pull driver
+  alone can't pull the line below ~2 V against it; the C5 then reads
+  the line as "always high". With the 1k to GND the line swings 0–3.3
+  V cleanly.
+- **Sync on 0x55 + PID parity, not on UART BREAK events.** The default
+  IDF break-detection threshold (~23 bit times) often misses LIN
+  BREAKs (≥13 bits). Streaming the bytes and looking for `0x55`
+  followed by a valid PID is more robust and avoids tuning HAL-private
+  registers.
+
+## Truma LIN sim REPL
+
+In addition to the solar/BMS commands, the USB-CDC REPL exposes:
+
+```
+troom <C>                    set reported room temperature
+twater <C>                   set reported water temperature
+tburn 0|1                    burner state in frame 0x22
+terr <class> [code [short]]  populate TGetErrorInfo reply
+tstatus                      dump Truma sim state
+```
 
 ## Protocol references
 
@@ -79,6 +133,7 @@ spec without needing to read the parent repo:
   format, AES-CTR nonce layout, plaintext field offsets.
 - `ultimatronble/SKILL.md` — Ultimatron / JBD BMS GATT protocol, the
   `DD A5 03 00 FF FD 77` query and the response packet layout.
+- `truma-protocol/SKILL.md` — full Truma LIN frame reference (master/slave frames, byte layouts).
 
 The encoder in `main.c::build_victron_mfr()` mirrors the *inverse* of
 the parser in TruMinus's `main/victronble.cpp::parseMfrData()`.  If
