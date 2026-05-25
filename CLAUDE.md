@@ -20,8 +20,14 @@ spare dev board and pretends to be:
    `0xFF00` and the JBD-protocol characteristics `0xFF01` (notify) /
    `0xFF02` (write).  Responds to the standard read-basic-info command
    `DD A5 03 00 FF FD 77` with canned voltage / current / SOC / temp.
+3. A **fresh-water tank level sensor** — broadcasts a BTHome v2
+   unencrypted Service Data frame (UUID `0xFCD2`) carrying the
+   *Moisture* tag (`0x2F`, `uint8` 0..100 %).  The Victron mfr-data
+   adv and the BTHome adv alternate every 2 s on the same legacy
+   advertising channel; both fit comfortably inside the 31-byte
+   payload limit on their own but not combined.
 
-Both roles live on a **single BLE identity / one MAC**.  The TruMinus P4
+All roles live on a **single BLE identity / one MAC**.  The TruMinus P4
 firmware (`../TruMinus/`, separate repo) is configured to point both
 `solar/addr` and `batt/addr` NVS keys at this MAC.  When the P4 connects
 for an Ultimatron GATT poll, the Victron advertising pauses briefly and
@@ -61,8 +67,10 @@ clean tree.
 ## Source layout
 
 - `main/main.c` — NimBLE init, GAP/GATT, AES-CTR encryption of the
-  Victron payload, GATT service definition, value updater task, USB-CDC
-  REPL. Calls `truma_sim_init()` at the end of `app_main`.
+  Victron payload, BTHome v2 service-data builder for the fresh-water
+  tank role, GATT service definition, value updater task that
+  alternates Victron / BTHome adv payloads every 2 s, USB-CDC REPL.
+  Calls `truma_sim_init()` at the end of `app_main`.
 - `main/truma_sim.[ch]` — Truma Combi D LIN slave simulator on UART1.
   TX=GPIO20, RX=GPIO21, 9600 8N1, TTL-direct (no LIN transceiver).
   Publishes frames 0x21 (room/water temperatures) and 0x22 (burner
@@ -122,6 +130,41 @@ tburn 0|1                    burner state in frame 0x22
 terr <class> [code [short]]  populate TGetErrorInfo reply
 tstatus                      dump Truma sim state
 ```
+
+And for the fresh-water tank role:
+
+```
+tank <pct 0..100>            pin the BTHome moisture value;
+                             disables the sinusoidal autocycle so
+                             the value sticks until rebooted or
+                             `auto on` is re-issued
+```
+
+## BTHome v2 tank-level adv
+
+Frame layout produced by `update_adv_data_bthome()` in `main.c`:
+
+```
+AD: 02 01 06                              Flags
+AD: 03 03 D2 FC                           Complete list of 16-bit UUIDs (BTHome)
+AD: 08 16 D2 FC 40 00 <seq> 2F <pct>      Service Data:
+     - UUID 0xFCD2 (BTHome) little-endian
+     - Device info 0x40 = v2, unencrypted, no trigger
+     - Tag 0x00 (Packet ID, uint8) + seq    — used by receiver for dedup
+     - Tag 0x2F (Moisture, uint8 0..100 %) + pct   ← the tank level
+```
+
+Sequence: `s_tankSeq` increments on every BTHome emission (8-bit
+wrap).  The P4 (`main/tankble.cpp`) treats the same seq twice in a row
+as a re-emit and skips it; that keeps the LCD/web from flickering when
+the adv repeats inside one scan window.
+
+No encryption: bit 0 of the device-info byte stays clear.  The MAC
+allow-list on the P4 (`tank/addr` NVS key) is the only access control —
+fine for a sensor that only carries one byte of household telemetry.
+Match the receiver:  `.claude/skills/` on the P4 side does not have a
+dedicated BTHome skill; the format is simple enough that the comment
+block in `main/tankble.cpp` is the canonical reference.
 
 ## Protocol references
 
