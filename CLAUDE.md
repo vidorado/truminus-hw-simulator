@@ -15,24 +15,32 @@ spare dev board and pretends to be:
 
 1. A **Victron SmartSolar MPPT** — broadcasts the *Instant Readout* BLE
    advertising payload (AES-CTR encrypted manufacturer data, manuf id
-   `0x02E1`), cycling values via `sinf()` every 2 s.
+   `0x02E1`, readout type `0x01`), cycling values via `sinf()` every 2 s.
 2. An **Ultimatron LiFePO4 BMS** — exposes a GATT server with service
    `0xFF00` and the JBD-protocol characteristics `0xFF01` (notify) /
    `0xFF02` (write).  Responds to the standard read-basic-info command
    `DD A5 03 00 FF FD 77` with canned voltage / current / SOC / temp.
 3. A **fresh-water tank level sensor** — broadcasts a BTHome v2
    unencrypted Service Data frame (UUID `0xFCD2`) carrying the
-   *Moisture* tag (`0x2F`, `uint8` 0..100 %).  The Victron mfr-data
-   adv and the BTHome adv alternate every 2 s on the same legacy
-   advertising channel; both fit comfortably inside the 31-byte
-   payload limit on their own but not combined.
+   *Moisture* tag (`0x2F`, `uint8` 0..100 %).
+4. A **Victron Multiplus II** (VE.Bus Smart dongle) — broadcasts
+   *Instant Readout* BLE advertising with readout type `0x0C` and
+   a distinct AES-128 bind key.  The 102-bit packed plaintext carries
+   device state, error, battery V/A/T, AC in/out W, AC-in state,
+   alarm, and SOC — identical to what a real VE.Bus Smart dongle emits.
+   See `../TruMinus/.claude/skills/multiplusble/SKILL.md` for the
+   bit-level layout.
+
+The advertising rotates three payloads (solar → BTHome tank → multiplus)
+every 2 s on the same legacy advertising channel.  In a 5 s P4 scan
+window each payload appears at least once.
 
 All roles live on a **single BLE identity / one MAC**.  The TruMinus P4
-firmware (`../TruMinus/`, separate repo) is configured to point both
-`solar/addr` and `batt/addr` NVS keys at this MAC.  When the P4 connects
-for an Ultimatron GATT poll, the Victron advertising pauses briefly and
-resumes on disconnect — fine because the P4 polls Ultimatron once every
-~30 s.
+firmware (`../TruMinus/`, separate repo) is configured to point
+`solar/addr`, `batt/addr` and `multiplus/addr` NVS keys at this MAC.
+When the P4 connects for an Ultimatron GATT poll, the Victron
+advertising pauses briefly and resumes on disconnect — fine because the
+P4 polls Ultimatron once every ~30 s.
 
 If you need true two-device separation (distinct MACs simultaneously),
 migrate to BLE 5 extended advertising with two adv sets.  That's a
@@ -67,10 +75,10 @@ clean tree.
 ## Source layout
 
 - `main/main.c` — NimBLE init, GAP/GATT, AES-CTR encryption of the
-  Victron payload, BTHome v2 service-data builder for the fresh-water
-  tank role, GATT service definition, value updater task that
-  alternates Victron / BTHome adv payloads every 2 s, USB-CDC REPL.
-  Calls `truma_sim_init()` at the end of `app_main`.
+  Victron Solar + VE.Bus payloads, BTHome v2 service-data builder for
+  the fresh-water tank role, GATT service definition, value updater
+  task that rotates Solar / BTHome / Multiplus adv payloads every 2 s,
+  USB-CDC REPL.  Calls `truma_sim_init()` at the end of `app_main`.
 - `main/truma_sim.[ch]` — Truma Combi D LIN slave simulator on UART1.
   TX=GPIO20, RX=GPIO21, 9600 8N1, TTL-direct (no LIN transceiver).
   Publishes frames 0x21 (room/water temperatures) and 0x22 (burner
@@ -140,6 +148,25 @@ tank <pct 0..100>            pin the BTHome moisture value;
                              `auto on` is re-issued
 ```
 
+## Multiplus VE.Bus REPL
+
+```
+mstate <0-11>                device state (0=Off 3=Bulk 5=Float 9=Invert …)
+merr <n>                     error code (0=none)
+macin <W>                    AC input (shore) power in W
+macout <W>                   AC output (load) power in W
+mv <V>                       battery voltage
+ma <A>                       battery current (neg = inverting)
+msoc <%>                     state of charge
+mtemp <°C>                   battery temperature
+malarm <0-2>                 alarm (0=none 1=warning 2=alarm)
+macst <0-2>                  AC input state (0=AC1 1=AC2 2=disconnected)
+mstatus                      dump all multiplus state
+```
+
+All `m*` commands that set values cycling in autocycle also disable
+autocycle so the value sticks.  Use `auto on` to resume cycling.
+
 ## BTHome v2 tank-level adv
 
 Frame layout produced by `update_adv_data_bthome()` in `main.c`:
@@ -179,24 +206,30 @@ spec without needing to read the parent repo:
 - `truma-protocol/SKILL.md` — full Truma LIN frame reference (master/slave frames, byte layouts).
 
 The encoder in `main.c::build_victron_mfr()` mirrors the *inverse* of
-the parser in TruMinus's `main/victronble.cpp::parseMfrData()`.  If
-the field encoding ever drifts, update both sides — the P4 parser is
-authoritative because it reads real Victron devices in production.
+the parser in TruMinus's `main/victronble.cpp::parseMfrData()`.  The
+encoder in `build_multiplus_mfr()` mirrors the *inverse* of the
+`BitReader` in `main/multiplusble.cpp::multiplusBleHandleAd()`.  If
+the field encoding ever drifts, update both sides — the P4 parsers are
+authoritative because they read real Victron devices in production.
 
 ## Configuration shared with the P4
 
 Hardcoded constants in `main/main.c` that the P4's NVS must match:
 
-| Constant in `main.c`     | P4 NVS key              | Value                                |
-|--------------------------|-------------------------|--------------------------------------|
-| `s_aes_key[16]`          | `solar/key` (hex str)   | `00112233445566778899AABBCCDDEEFF`   |
-| (device's own random MAC)| `solar/addr` AND `batt/addr` | read from the C3 boot log     |
+| Constant in `main.c`     | P4 NVS key                          | Value                                |
+|--------------------------|--------------------------------------|--------------------------------------|
+| `s_aes_key[16]`          | `solar/key` (hex str)                | `00112233445566778899AABBCCDDEEFF`   |
+| `s_multi_key[16]`        | `multiplus/key` (hex str)            | `FFEEDDCCBBAA99887766554433221100`   |
+| (device's own random MAC)| `solar/addr`, `batt/addr`, `multiplus/addr` | read from the C3 boot log     |
 
 On first boot, monitor the C3:
 ```
 I (xxx) blesim: Device MAC: AA:BB:CC:DD:EE:FF  type=1
+I (xxx) blesim: Solar  key: 00112233445566778899AABBCCDDEEFF
+I (xxx) blesim: Multi  key: FFEEDDCCBBAA99887766554433221100
 ```
-Copy that MAC into both NVS slots on the P4 via the settings UI.
+Copy that MAC into the three NVS addr slots on the P4 and each key
+into the corresponding key slot via the settings UI (⚙ → Monitorización).
 
 ## Common edits
 
@@ -204,6 +237,7 @@ Copy that MAC into both NVS slots on the P4 via the settings UI.
 - **Add an Ultimatron field** → extend `send_bms_response()`; consult
   the ultimatronble skill for the byte offsets the P4 reads.
 - **Change Victron device state** (bulk / float / fault) → `s_state`.
+- **Change Multiplus device state** → `s_mDevState` or REPL `mstate`.
 - **Add password auth to Ultimatron** → already partially scaffolded
   in `gatt_ff02_access()`; just match `buf[0]==0xDD && buf[1]==0x5A`.
 

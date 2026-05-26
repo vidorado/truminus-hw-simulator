@@ -41,9 +41,15 @@
 static const char* TAG = "blesim";
 
 // ── Configuration (match P4 NVS) ─────────────────────────────────────────
+// Solar charger key → P4 NVS `solar/key`
 static const uint8_t s_aes_key[16] = {
     0x00,0x11,0x22,0x33, 0x44,0x55,0x66,0x77,
     0x88,0x99,0xAA,0xBB, 0xCC,0xDD,0xEE,0xFF,
+};
+// Multiplus VE.Bus key → P4 NVS `multiplus/key` (distinct per device)
+static const uint8_t s_multi_key[16] = {
+    0xFF,0xEE,0xDD,0xCC, 0xBB,0xAA,0x99,0x88,
+    0x77,0x66,0x55,0x44, 0x33,0x22,0x11,0x00,
 };
 #define DEVICE_NAME "TruMinus-BLESim"
 
@@ -64,6 +70,19 @@ static volatile float   s_tempC     = 20.0f;  // BMS NTC1
 static volatile uint8_t s_tankPct   = 60;     // BTHome tank level %, 0..100
 static volatile uint8_t s_tankSeq   = 0;      // BTHome packet-id (dedup)
 static volatile bool    s_autocycle = true;   // sinf() updater on/off
+
+// ── Multiplus VE.Bus state ──────────────────────────────────────────────
+static uint16_t         s_multi_iv  = 0;
+static volatile uint8_t s_mDevState = 9;      // 9 = Inverting
+static volatile uint8_t s_mError    = 0;
+static volatile float   s_mBattV    = 12.80f;
+static volatile float   s_mBattA    = -32.5f; // neg = inverting (draw from batt)
+static volatile int32_t s_mAcInW    = 0;      // shore power in W
+static volatile int32_t s_mAcOutW   = 420;    // load power in W
+static volatile uint8_t s_mAcInSt   = 2;      // 0=AC1, 1=AC2, 2=disconnected
+static volatile uint8_t s_mAlarm    = 0;      // 0=none, 1=warn, 2=alarm
+static volatile int8_t  s_mBattTmpC = 25;     // battery temp °C
+static volatile uint8_t s_mSoc      = 87;     // SOC %
 
 static void advertise(void);
 static void update_adv_data(void);
@@ -171,6 +190,85 @@ static void update_adv_data_bthome(void) {
     adv[p++] = 0x2F; adv[p++] = s_tankPct;     // moisture (uint8 0..100%)
     int rc = ble_gap_adv_set_data(adv, p);
     if (rc) ESP_LOGW(TAG, "adv_set_data (bthome) rc=%d", rc);
+}
+
+// ── Multiplus VE.Bus Instant Readout payload ────────────────────────────
+// Packs the 102-bit LSB-first stream that the P4's BitReader decodes.
+static void bitwrite(uint8_t* buf, int* pos, uint64_t val, int bits) {
+    for (int i = 0; i < bits; i++) {
+        int byte_idx = (*pos) / 8;
+        int bit_idx  = (*pos) % 8;
+        if (val & (1ULL << i))
+            buf[byte_idx] |= (1U << bit_idx);
+        (*pos)++;
+    }
+}
+
+static int build_multiplus_mfr(uint8_t* out /*26 bytes*/) {
+    out[0] = 0xE1; out[1] = 0x02;          // manufacturer id = 0x02E1
+    out[2] = 0x10;                          // PRODUCT_ADVERTISEMENT
+    out[3] = 0xA0; out[4] = 0xA0;          // product ID (arbitrary)
+    out[5] = 0x02; out[6] = 0x0C;          // readout_type = VE.Bus
+    out[7] = (uint8_t)(s_multi_iv & 0xFF);
+    out[8] = (uint8_t)((s_multi_iv >> 8) & 0xFF);
+    out[9] = s_multi_key[0];               // key check byte
+    s_multi_iv++;
+
+    // Pack the 102-bit plaintext
+    uint8_t plain[16];
+    memset(plain, 0, sizeof(plain));
+    int pos = 0;
+    bitwrite(plain, &pos, s_mDevState, 8);
+    bitwrite(plain, &pos, s_mError, 8);
+    // battery_current: signed 16 bits, 0.1 A
+    int16_t rawA = (int16_t)lroundf(s_mBattA * 10.0f);
+    bitwrite(plain, &pos, (uint64_t)(uint16_t)rawA, 16);
+    // battery_voltage: unsigned 14 bits, 0.01 V
+    uint16_t rawV = (uint16_t)lroundf(s_mBattV * 100.0f);
+    if (rawV > 0x3FFE) rawV = 0x3FFE;
+    bitwrite(plain, &pos, rawV, 14);
+    bitwrite(plain, &pos, s_mAcInSt, 2);
+    // ac_in_power: signed 19 bits, 1 W
+    bitwrite(plain, &pos, (uint64_t)(uint32_t)(int32_t)s_mAcInW & 0x7FFFF, 19);
+    // ac_out_power: signed 19 bits, 1 W
+    bitwrite(plain, &pos, (uint64_t)(uint32_t)(int32_t)s_mAcOutW & 0x7FFFF, 19);
+    bitwrite(plain, &pos, s_mAlarm, 2);
+    // battery_temperature: unsigned 7 bits, °C + 40
+    uint8_t rawT = (uint8_t)((int)s_mBattTmpC + 40);
+    if (rawT > 0x7E) rawT = 0x7E;
+    bitwrite(plain, &pos, rawT, 7);
+    // soc: unsigned 7 bits, 1 %
+    uint8_t socV = s_mSoc;
+    if (socV > 0x7E) socV = 0x7E;
+    bitwrite(plain, &pos, socV, 7);
+
+    // AES-CTR encrypt with the multiplus key
+    uint8_t nonce[16]  = {0};
+    uint8_t stream[16] = {0};
+    size_t  nc_off     = 0;
+    nonce[0] = out[7];
+    nonce[1] = out[8];
+    esp_aes_context ctx;
+    esp_aes_init(&ctx);
+    esp_aes_setkey(&ctx, s_multi_key, 128);
+    esp_aes_crypt_ctr(&ctx, 16, &nc_off, nonce, stream, plain, out + 10);
+    esp_aes_free(&ctx);
+    return 26;
+}
+
+static void update_adv_data_multiplus(void) {
+    uint8_t mfr[26];
+    build_multiplus_mfr(mfr);
+    uint8_t adv[31];
+    int p = 0;
+    adv[p++] = 2;
+    adv[p++] = 0x01;
+    adv[p++] = 0x06;
+    adv[p++] = 1 + 26;
+    adv[p++] = 0xFF;
+    memcpy(adv + p, mfr, 26); p += 26;
+    int rc = ble_gap_adv_set_data(adv, p);
+    if (rc) ESP_LOGW(TAG, "adv_set_data (multi) rc=%d", rc);
 }
 
 // ── GATT 0xFF00 / FF01 (notify) / FF02 (write) ───────────────────────────
@@ -298,6 +396,8 @@ static void on_sync(void) {
     ESP_LOGI(TAG, "Device MAC: %02X:%02X:%02X:%02X:%02X:%02X  type=%d",
              addr[5], addr[4], addr[3], addr[2], addr[1], addr[0],
              s_own_addr_type);
+    ESP_LOGI(TAG, "Solar  key: 00112233445566778899AABBCCDDEEFF");
+    ESP_LOGI(TAG, "Multi  key: FFEEDDCCBBAA99887766554433221100");
     ble_svc_gap_device_name_set(DEVICE_NAME);
     advertise();
 }
@@ -313,29 +413,31 @@ static void on_reset(int reason) {
 // P4 scan window each payload is always present at least once.
 static void updater_task(void* arg) {
     (void)arg;
-    bool bthome_turn = false;
+    int adv_phase = 0;   // 0=solar, 1=bthome, 2=multiplus
     while (1) {
         if (s_autocycle) {
             float t = (float)(esp_timer_get_time() / 1000000ULL);
+            // Solar charger values
             s_battV    = 13.0f  + 0.3f  * sinf(t * 0.6f);
             s_battA    =  4.0f  + 3.0f  * sinf(t * 0.4f);
             s_pvW      = 100.0f + 60.0f * sinf(t * 0.7f);
             s_kWhToday =   1.0f + (t / 3600.0f);
-            // Tank level: oscillates 25..95 % over ~10 min so the P4 sees
-            // visible changes without flooding the WS broadcast diff filter.
             float pctF = 60.0f + 35.0f * sinf(t * 0.01f);
             if (pctF < 0.0f)   pctF = 0.0f;
             if (pctF > 100.0f) pctF = 100.0f;
             s_tankPct = (uint8_t)lroundf(pctF);
+            // Multiplus values
+            s_mBattV   = 12.5f + 0.5f * sinf(t * 0.3f);
+            s_mBattA   = -30.0f + 10.0f * sinf(t * 0.25f);
+            s_mAcOutW  = (int32_t)(350.0f + 150.0f * sinf(t * 0.35f));
         }
         if (s_conn_handle == BLE_HS_CONN_HANDLE_NONE) {
-            if (bthome_turn) {
-                s_tankSeq++;          // bump BTHome packet ID each emission
-                update_adv_data_bthome();
-            } else {
-                update_adv_data();
+            switch (adv_phase) {
+            case 0: update_adv_data();        break;
+            case 1: s_tankSeq++; update_adv_data_bthome(); break;
+            case 2: update_adv_data_multiplus(); break;
             }
-            bthome_turn = !bthome_turn;
+            adv_phase = (adv_phase + 1) % 3;
         }
         vTaskDelay(pdMS_TO_TICKS(2000));
     }
@@ -347,6 +449,25 @@ static void print_status(void) {
            s_battV, s_battA, s_pvW, s_kWhToday,
            (unsigned)s_state, (unsigned)s_soc, s_tempC, (unsigned)s_tankPct,
            s_autocycle ? "on" : "off");
+}
+
+static const char* multi_state_name(uint8_t st) {
+    switch (st) {
+        case 0: return "Off";       case 1: return "LowPwr";
+        case 2: return "Fault";     case 3: return "Bulk";
+        case 4: return "Absorb";    case 5: return "Float";
+        case 8: return "Passthru";  case 9: return "Invert";
+        case 10: return "PwrAssist";default: return "?";
+    }
+}
+
+static void print_multi_status(void) {
+    printf("multi: state=%u(%s) err=%u acIn=%dW acOut=%dW V=%.2f A=%.1f"
+           " soc=%u%% temp=%d°C alarm=%u acInSt=%u\r\n",
+           (unsigned)s_mDevState, multi_state_name(s_mDevState),
+           (unsigned)s_mError, (int)s_mAcInW, (int)s_mAcOutW,
+           s_mBattV, s_mBattA, (unsigned)s_mSoc,
+           (int)s_mBattTmpC, (unsigned)s_mAlarm, (unsigned)s_mAcInSt);
 }
 
 static void handle_line(char* line) {
@@ -363,9 +484,13 @@ static void handle_line(char* line) {
         printf("truma:     troom <C> | twater <C> | tburn 0|1 |"
                " terr <class> [code [short]] | tstatus\r\n");
         printf("tank:      tank <pct 0..100>     (BTHome moisture adv)\r\n");
+        printf("multi:     mstate <0-11> | merr <n> | macin <W> | macout <W>\r\n"
+               "           mv <V> | ma <A> | msoc <%%> | mtemp <C> | malarm <0-2>\r\n"
+               "           macst <0-2> | mstatus\r\n");
         return;
     }
     if (strcmp(cmd, "status") == 0)  { print_status(); return; }
+    if (strcmp(cmd, "mstatus") == 0) { print_multi_status(); return; }
     if (strcmp(cmd, "tstatus") == 0) { truma_sim_print_status(); return; }
     if (strcmp(cmd, "tping") == 0)   { truma_sim_ping(); printf("tx 0x21\r\n"); return; }
     if (strcmp(cmd, "ttoggle") == 0) {
@@ -425,6 +550,51 @@ static void handle_line(char* line) {
         truma_sim_set_error(k, c, s);
         truma_sim_print_status();
         return;
+    }
+    else if (strcmp(cmd, "mstate") == 0) {
+        s_mDevState = (uint8_t)strtol(arg, NULL, 0);
+        s_autocycle = false;
+        print_multi_status(); return;
+    }
+    else if (strcmp(cmd, "merr") == 0) {
+        s_mError = (uint8_t)strtol(arg, NULL, 0);
+        print_multi_status(); return;
+    }
+    else if (strcmp(cmd, "macin") == 0) {
+        s_mAcInW = (int32_t)strtol(arg, NULL, 0);
+        s_autocycle = false;
+        print_multi_status(); return;
+    }
+    else if (strcmp(cmd, "macout") == 0) {
+        s_mAcOutW = (int32_t)strtol(arg, NULL, 0);
+        s_autocycle = false;
+        print_multi_status(); return;
+    }
+    else if (strcmp(cmd, "mv") == 0) {
+        s_mBattV = strtof(arg, NULL);
+        s_autocycle = false;
+        print_multi_status(); return;
+    }
+    else if (strcmp(cmd, "ma") == 0) {
+        s_mBattA = strtof(arg, NULL);
+        s_autocycle = false;
+        print_multi_status(); return;
+    }
+    else if (strcmp(cmd, "msoc") == 0) {
+        s_mSoc = (uint8_t)strtol(arg, NULL, 0);
+        print_multi_status(); return;
+    }
+    else if (strcmp(cmd, "mtemp") == 0) {
+        s_mBattTmpC = (int8_t)strtol(arg, NULL, 0);
+        print_multi_status(); return;
+    }
+    else if (strcmp(cmd, "malarm") == 0) {
+        s_mAlarm = (uint8_t)strtol(arg, NULL, 0);
+        print_multi_status(); return;
+    }
+    else if (strcmp(cmd, "macst") == 0) {
+        s_mAcInSt = (uint8_t)strtol(arg, NULL, 0);
+        print_multi_status(); return;
     }
     else { printf("unknown: %s (try '?')\r\n", cmd); return; }
     print_status();
