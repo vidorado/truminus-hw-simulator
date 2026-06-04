@@ -163,6 +163,46 @@ static void respond_0x3D(void) {
     s_pending_sid = 0;
 }
 
+// Decode and log the master's commanded setpoints whenever they change. On the
+// bench the serial monitor is the only feedback, so this makes the P4 -> boiler
+// control path observable: it inverts the CP-Plus 0x20 encoding (room/water
+// Kelvin x10 with the 0xAA "off" sentinels, fan/water mode nibbles) plus the
+// On/Off request from the 0x3C 0xB8 service frame. Logged on change only, so a
+// steady stream of identical 0x20 frames doesn't spam.
+static void log_master_change(void) {
+    static bool    have = false;
+    static uint8_t l_lo, l_hi, l_water, l_modes, l_req = 0xFF;
+
+    bool chg = !have || l_lo != s_room_sp_lo || l_hi != s_room_sp_hi ||
+               l_water != s_water_sp || l_modes != s_modes || l_req != s_req_state;
+    if (!chg) return;
+
+    char room[16], water[16];
+    if (s_room_sp_lo == 0xAA && s_room_sp_hi == 0xAA) {
+        snprintf(room, sizeof room, "off");
+    } else {
+        uint16_t raw = s_room_sp_lo | ((uint16_t)(s_room_sp_hi & 0x0F) << 8);
+        snprintf(room, sizeof room, "%.1fC", raw / 10.0f - 273.0f);
+    }
+    if (s_water_sp == 0xAA) {
+        snprintf(water, sizeof water, "off");
+    } else {
+        // Low nibble is dropped by the master's >>4 packing, so this is ~1.6C coarse.
+        uint16_t raw = (uint16_t)s_water_sp << 4;
+        snprintf(water, sizeof water, "~%.0fC", raw / 10.0f - 273.0f);
+    }
+    uint8_t fan = s_modes >> 4, wmode = s_modes & 0x0F;
+    const char* fanlbl = (fan == 0xB) ? "heat-eco"
+                       : (fan == 0xD) ? "heat-high"
+                       : (fan == 0x0) ? "off" : "fan-only";
+    ESP_LOGI(TAG, "master cmd: on=%d room_sp=%s water_sp=%s fan=%s(0x%X) wmode=0x%X",
+             s_req_state == 2, room, water, fanlbl, fan, wmode);
+
+    have = true;
+    l_lo = s_room_sp_lo; l_hi = s_room_sp_hi;
+    l_water = s_water_sp; l_modes = s_modes; l_req = s_req_state;
+}
+
 // ── Consumers ────────────────────────────────────────────────────────────
 static void on_master_frame(uint8_t id, const uint8_t* d, int n) {
     if (id == 0x20 && n >= 8) {
@@ -180,6 +220,7 @@ static void on_master_frame(uint8_t id, const uint8_t* d, int n) {
             s_pending_sid       = 0xB2;
         }
     }
+    log_master_change();
 }
 
 // ── Wire-side task ───────────────────────────────────────────────────────
