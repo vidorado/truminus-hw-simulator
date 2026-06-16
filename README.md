@@ -95,10 +95,61 @@ A small command interpreter runs on the USB-CDC console. Open it with
 Set `auto off` right after your first manual command so the cycler stops
 overwriting values every 2 s.
 
+## OpenAir PLUS capture mode
+
+A second build personality impersonates a **Bergstrom/Dirna OpenAir PLUS**
+air-conditioning unit, so the official OpenAir PLUS Android app connects to
+the C3 instead of the real A/C. Every command the app writes is logged, which
+recovers the command-side protocol **a priori — no real unit, no sniffer**.
+Protocol reference: the `openair-plus` skill in the TruMinus P4 repo.
+
+```bash
+make openair                 # build the OpenAir personality
+make openair-flash-monitor   # flash + watch the capture log
+```
+
+It advertises as **`My OpenAir PLUS`** (the name the app's scan screen filters
+for; service `e43ff2c2…`). The two characteristics are bidirectional in an
+unusual way: `9d667ea8…` (WRITE) only receives the connect-time `writeId`
+handshake, while **`4a01b4dd…` (NOTIFY+READ+WRITE)** carries both the telemetry
+notifications *and* every command the app sends (`writeMessage`). The sim pushes
+a valid 124-char telemetry frame so the app's home screen renders, then logs and
+decodes each command write:
+
+```
+openair: ==== COMMAND write (4a01b4dd) ====
+openair: ──── WRITE from app: 60 bytes ────
+openair: ascii: "0000dafc0000000100000000000000d20001000000000000000000000000"
+openair: RealTimeClock=56060 (15:34:20)  BatteryType=0  Power=1  TempScale=0
+openair: PowerState=0  Mode=0  Temp=210 (21.0 C)  BlowerSpeed=1
+openair: LedBright=0  LedColor=0  ScheduledTime=0  Flaps1Mode=0  Flaps2Mode=0
+```
+
+The command/read frame layout (byte offsets, scaling, confirmed enum values such
+as `PowerState` 0/1, `Mode` AUTO=0/MAN=2, `Temp` ×10) is documented in the
+`openair-plus` skill in the TruMinus P4 repo. The REPL (over `make monitor`)
+drives the telemetry pushed back to the app:
+
+| Command            | Effect                                                   |
+|--------------------|----------------------------------------------------------|
+| `oa`               | Connection state + the write-field table                 |
+| `oahelp`           | List OpenAir commands                                     |
+| `oasend`           | Send one telemetry notification now                      |
+| `oaauto on\|off`   | Periodic telemetry resend while connected (on by default)|
+| `oaset <idx> <v>`  | Set a telemetry field's raw value (e.g. `oaset 6 210` = 21.0 °C) |
+| `oastr <payload>`  | Notify an arbitrary literal payload (probe the parser)   |
+
+`build_frame()` emits the confirmed 62-byte read layout (124 chars) by default,
+so the app renders without manual `oastr`. Use `oaset` to push specific values
+and watch the app render them.
+
 ## Source layout
 
 - `main/main.c` — everything: NimBLE init, GAP/GATT, AES-CTR encoder, GATT
-  callbacks, value updater task, USB-CDC REPL.
+  callbacks, value updater task, USB-CDC REPL. The OpenAir personality is
+  selected by the `OPENAIR_SIM` compile define (see `make openair`).
+- `main/openair_sim.c/.h` — OpenAir PLUS A/C capture role (GATT, write logger,
+  telemetry, REPL). Built always; only active under `OPENAIR_SIM`.
 - `main/CMakeLists.txt` — component registration.
 - `CMakeLists.txt` — top-level IDF project.
 - `sdkconfig.defaults` — `IDF_TARGET=esp32c3`, NimBLE peripheral-only, MTU 247.

@@ -33,6 +33,7 @@
 #include <ctype.h>
 
 #include "truma_sim.h"
+#include "openair_sim.h"
 
 // LIN pins to the Truma consumer board (TTL direct, no transceiver).
 #define TRUMA_LIN_TX_GPIO  21
@@ -56,8 +57,10 @@ static const uint8_t s_multi_key[16] = {
 // ── State ────────────────────────────────────────────────────────────────
 static uint8_t  s_own_addr_type;
 static uint16_t s_conn_handle  = BLE_HS_CONN_HANDLE_NONE;
+#ifndef OPENAIR_SIM
 static uint16_t s_attr_ff01    = 0;
 static uint16_t s_attr_ff02    = 0;
+#endif
 static uint16_t s_iv           = 0;
 
 static volatile float   s_battV     = 13.20f;
@@ -272,6 +275,7 @@ static void update_adv_data_multiplus(void) {
 }
 
 // ── GATT 0xFF00 / FF01 (notify) / FF02 (write) ───────────────────────────
+#ifndef OPENAIR_SIM
 static void send_bms_response(void) {
     if (s_conn_handle == BLE_HS_CONN_HANDLE_NONE) return;
     // JBD frame: DD 03 00 <len> [data...] <chkH> <chkL> 77  → total = 4 + len + 3
@@ -343,10 +347,34 @@ static const struct ble_gatt_svc_def gatt_svcs[] = {
     },
     { 0 },
 };
+#endif // !OPENAIR_SIM
 
 // ── GAP event ────────────────────────────────────────────────────────────
 static int gap_event(struct ble_gap_event* event, void* arg) {
     (void)arg;
+#ifdef OPENAIR_SIM
+    // OpenAir personality fully owns the connection lifecycle.
+    switch (event->type) {
+    case BLE_GAP_EVENT_CONNECT:
+        openair_sim_on_gap_event(event);
+        if (event->connect.status != 0)
+            openair_sim_advertise(s_own_addr_type, gap_event);
+        return 0;
+    case BLE_GAP_EVENT_DISCONNECT:
+        openair_sim_on_gap_event(event);
+        openair_sim_advertise(s_own_addr_type, gap_event);
+        return 0;
+    case BLE_GAP_EVENT_SUBSCRIBE:
+        openair_sim_on_gap_event(event);
+        return 0;
+    case BLE_GAP_EVENT_MTU:
+        ESP_LOGI(TAG, "openair: MTU=%u", event->mtu.value);
+        return 0;
+    default:
+        ESP_LOGI(TAG, "openair: GAP event type=%d", event->type);
+        return 0;
+    }
+#endif
     switch (event->type) {
     case BLE_GAP_EVENT_CONNECT:
         if (event->connect.status == 0) {
@@ -396,10 +424,31 @@ static void on_sync(void) {
     ESP_LOGI(TAG, "Device MAC: %02X:%02X:%02X:%02X:%02X:%02X  type=%d",
              addr[5], addr[4], addr[3], addr[2], addr[1], addr[0],
              s_own_addr_type);
+#ifndef OPENAIR_SIM
     ESP_LOGI(TAG, "Solar  key: 00112233445566778899AABBCCDDEEFF");
     ESP_LOGI(TAG, "Multi  key: FFEEDDCCBBAA99887766554433221100");
+#endif
+#ifdef OPENAIR_SIM
+    // Use a fresh random static address each boot. Android caches a device's
+    // GATT by MAC; iterating the service layout across flashes on one MAC makes
+    // the app discover a stale cached map and bail. A new MAC = a new device to
+    // Android = a clean discovery every time. (Re-scan in the app after each
+    // reflash.)
+    {
+        ble_addr_t rnd;
+        if (ble_hs_id_gen_rnd(0, &rnd) == 0 && ble_hs_id_set_rnd(rnd.val) == 0) {
+            s_own_addr_type = BLE_OWN_ADDR_RANDOM;
+            ESP_LOGI(TAG, "openair: random MAC %02X:%02X:%02X:%02X:%02X:%02X",
+                     rnd.val[5], rnd.val[4], rnd.val[3],
+                     rnd.val[2], rnd.val[1], rnd.val[0]);
+        }
+    }
+    ble_svc_gap_device_name_set(OPENAIR_DEVICE_NAME);
+    openair_sim_advertise(s_own_addr_type, gap_event);
+#else
     ble_svc_gap_device_name_set(DEVICE_NAME);
     advertise();
+#endif
 }
 
 static void on_reset(int reason) {
@@ -415,6 +464,11 @@ static void updater_task(void* arg) {
     (void)arg;
     int adv_phase = 0;   // 0=solar, 1=bthome, 2=multiplus
     while (1) {
+#ifdef OPENAIR_SIM
+        openair_sim_tick();
+        vTaskDelay(pdMS_TO_TICKS(2000));
+        continue;
+#endif
         if (s_autocycle) {
             float t = (float)(esp_timer_get_time() / 1000000ULL);
             // Solar charger values
@@ -477,6 +531,17 @@ static void handle_line(char* line) {
     char* arg = strtok(NULL, " \t");
     if (!cmd) return;
     for (char* p = cmd; *p; p++) *p = (char)tolower((unsigned char)*p);
+
+#ifdef OPENAIR_SIM
+    {
+        char* a2 = strtok(NULL, " \t");
+        if (openair_sim_console(cmd, arg, a2)) return;
+        if (strcmp(cmd, "?") == 0 || strcmp(cmd, "help") == 0) {
+            printf("openair sim — type 'oahelp' for commands, 'oa' for status\r\n");
+            return;
+        }
+    }
+#endif
 
     if (strcmp(cmd, "?") == 0 || strcmp(cmd, "help") == 0) {
         printf("solar/bms: v <V> | a <A> | p <W> | k <kWh> | s <state>"
@@ -602,7 +667,7 @@ static void handle_line(char* line) {
 
 static void console_task(void* arg) {
     (void)arg;
-    char line[96];
+    char line[320];   // must hold "oastr " + a full telemetry frame (>=124 chars)
     size_t pos = 0;
     printf("\r\nblesim REPL — type '?' for help\r\n");
     print_status();
@@ -653,8 +718,12 @@ void app_main(void) {
 
     ble_svc_gap_init();
     ble_svc_gatt_init();
+#ifdef OPENAIR_SIM
+    openair_sim_register_gatt();
+#else
     ble_gatts_count_cfg(gatt_svcs);
     ble_gatts_add_svcs(gatt_svcs);
+#endif
 
     usb_serial_jtag_driver_config_t ucfg = USB_SERIAL_JTAG_DRIVER_CONFIG_DEFAULT();
     usb_serial_jtag_driver_install(&ucfg);
@@ -663,5 +732,7 @@ void app_main(void) {
     xTaskCreate(updater_task, "upd", 4096, NULL, 2, NULL);
     xTaskCreate(console_task, "con", 4096, NULL, 3, NULL);
 
+#ifndef OPENAIR_SIM
     truma_sim_init(TRUMA_LIN_TX_GPIO, TRUMA_LIN_RX_GPIO);
+#endif
 }
