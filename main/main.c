@@ -52,7 +52,7 @@ static const uint8_t s_multi_key[16] = {
     0xFF,0xEE,0xDD,0xCC, 0xBB,0xAA,0x99,0x88,
     0x77,0x66,0x55,0x44, 0x33,0x22,0x11,0x00,
 };
-#define DEVICE_NAME "TruMinus-BLESim"
+#define DEVICE_NAME "My OpenAir PLUS"
 
 // ── State ────────────────────────────────────────────────────────────────
 static uint8_t  s_own_addr_type;
@@ -274,6 +274,45 @@ static void update_adv_data_multiplus(void) {
     if (rc) ESP_LOGW(TAG, "adv_set_data (multi) rc=%d", rc);
 }
 
+// ── OpenAir PLUS advertising (default personality) ───────────────────────
+// So a single firmware advertises the A/C alongside Victron/BTHome/Multiplus,
+// letting the P4 see "My OpenAir PLUS" in its scan and switch to the
+// CLIMATIZACIÓN panel while the rest of the UI stays populated.  This is the
+// advertising side only (the P4 has no A/C BLE driver yet); the full GATT
+// command-capture personality still lives behind OPENAIR_SIM=1.
+#define OPENAIR_ADV_NAME "My OpenAir PLUS"
+// Service UUID e43ff2c2-8602-48f6-82d0-72cd56fb06f2, little-endian (matches
+// UUID_SVC in openair_sim.c).
+static const uint8_t s_openair_uuid_le[16] = {
+    0xf2, 0x06, 0xfb, 0x56, 0xcd, 0x72, 0xd0, 0x82,
+    0xf6, 0x48, 0x02, 0x86, 0xc2, 0xf2, 0x3f, 0xe4,
+};
+
+static void update_adv_data_openair(void) {
+    uint8_t adv[31];
+    int p = 0;
+    adv[p++] = 2;
+    adv[p++] = 0x01;
+    adv[p++] = 0x06;
+    adv[p++] = 1 + 16;
+    adv[p++] = 0x07;                          // complete list of 128-bit UUIDs
+    memcpy(adv + p, s_openair_uuid_le, 16); p += 16;
+    int rc = ble_gap_adv_set_data(adv, p);
+    if (rc) ESP_LOGW(TAG, "adv_set_data (openair) rc=%d", rc);
+}
+
+static void update_scan_rsp_openair(void) {
+    uint8_t sr[31];
+    int p = 0;
+    const char* name = OPENAIR_ADV_NAME;
+    int nlen = (int)strlen(name);
+    sr[p++] = 1 + nlen;
+    sr[p++] = 0x09;                           // complete local name
+    memcpy(sr + p, name, nlen); p += nlen;
+    int rc = ble_gap_adv_rsp_set_data(sr, p);
+    if (rc) ESP_LOGW(TAG, "adv_rsp_set_data (openair) rc=%d", rc);
+}
+
 // ── GATT 0xFF00 / FF01 (notify) / FF02 (write) ───────────────────────────
 #ifndef OPENAIR_SIM
 static void send_bms_response(void) {
@@ -429,20 +468,13 @@ static void on_sync(void) {
     ESP_LOGI(TAG, "Multi  key: FFEEDDCCBBAA99887766554433221100");
 #endif
 #ifdef OPENAIR_SIM
-    // Use a fresh random static address each boot. Android caches a device's
-    // GATT by MAC; iterating the service layout across flashes on one MAC makes
-    // the app discover a stale cached map and bail. A new MAC = a new device to
-    // Android = a clean discovery every time. (Re-scan in the app after each
-    // reflash.)
-    {
-        ble_addr_t rnd;
-        if (ble_hs_id_gen_rnd(0, &rnd) == 0 && ble_hs_id_set_rnd(rnd.val) == 0) {
-            s_own_addr_type = BLE_OWN_ADDR_RANDOM;
-            ESP_LOGI(TAG, "openair: random MAC %02X:%02X:%02X:%02X:%02X:%02X",
-                     rnd.val[5], rnd.val[4], rnd.val[3],
-                     rnd.val[2], rnd.val[1], rnd.val[0]);
-        }
-    }
+    // Advertise with the stable PUBLIC address (own_addr_type from infer_auto,
+    // public on a board with a burned-in MAC). The P4's OpenAir driver matches a
+    // configured MAC and connects to that exact address, so the advertised MAC
+    // must stay constant across reboots.
+    // Gotcha: when capturing with the Android app instead, a stable MAC lets the
+    // app reuse a stale cached GATT layout after a reflash — clear the app's
+    // Bluetooth cache or re-pair if discovery misbehaves there.
     ble_svc_gap_device_name_set(OPENAIR_DEVICE_NAME);
     openair_sim_advertise(s_own_addr_type, gap_event);
 #else
@@ -486,14 +518,19 @@ static void updater_task(void* arg) {
             s_mAcOutW  = (int32_t)(350.0f + 150.0f * sinf(t * 0.35f));
         }
         if (s_conn_handle == BLE_HS_CONN_HANDLE_NONE) {
+            // 4-phase rotation (Victron / BTHome / Multiplus / OpenAir).
+            // All phases advertise as "My OpenAir PLUS" (DEVICE_NAME); the
+            // other roles are matched by MAC + ADV mfr/service-data, not name.
+            // 750 ms/phase → 3 s full cycle.
             switch (adv_phase) {
-            case 0: update_adv_data();        break;
-            case 1: s_tankSeq++; update_adv_data_bthome(); break;
-            case 2: update_adv_data_multiplus(); break;
+            case 0: update_adv_data();           update_scan_rsp();        break;
+            case 1: s_tankSeq++; update_adv_data_bthome(); update_scan_rsp(); break;
+            case 2: update_adv_data_multiplus(); update_scan_rsp();        break;
+            case 3: update_adv_data_openair();   update_scan_rsp_openair(); break;
             }
-            adv_phase = (adv_phase + 1) % 3;
+            adv_phase = (adv_phase + 1) % 4;
         }
-        vTaskDelay(pdMS_TO_TICKS(2000));
+        vTaskDelay(pdMS_TO_TICKS(750));
     }
 }
 
