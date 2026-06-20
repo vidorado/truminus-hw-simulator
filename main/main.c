@@ -275,11 +275,11 @@ static void update_adv_data_multiplus(void) {
 }
 
 // ── OpenAir PLUS advertising (default personality) ───────────────────────
-// So a single firmware advertises the A/C alongside Victron/BTHome/Multiplus,
-// letting the P4 see "My OpenAir PLUS" in its scan and switch to the
-// CLIMATIZACIÓN panel while the rest of the UI stays populated.  This is the
-// advertising side only (the P4 has no A/C BLE driver yet); the full GATT
-// command-capture personality still lives behind OPENAIR_SIM=1.
+// One firmware advertises the A/C alongside Victron/BTHome/Multiplus and also
+// registers the A/C GATT service (see app_main), so the P4 sees "My OpenAir
+// PLUS" in its scan, connects, and populates the CLIMATIZACIÓN panel while the
+// rest of the UI stays live.  OPENAIR_SIM=1 remains the dedicated personality
+// for capturing the Android app's command writes in isolation.
 #define OPENAIR_ADV_NAME "My OpenAir PLUS"
 // Service UUID e43ff2c2-8602-48f6-82d0-72cd56fb06f2, little-endian (matches
 // UUID_SVC in openair_sim.c).
@@ -414,8 +414,11 @@ static int gap_event(struct ble_gap_event* event, void* arg) {
         return 0;
     }
 #endif
+    // The A/C role tracks the same connection (its own handle + notify CCCD) so
+    // an OpenAir GATT session works alongside the Ultimatron one.
     switch (event->type) {
     case BLE_GAP_EVENT_CONNECT:
+        openair_sim_on_gap_event(event);
         if (event->connect.status == 0) {
             s_conn_handle = event->connect.conn_handle;
             ESP_LOGI(TAG, "GAP connect ok, handle=%u", s_conn_handle);
@@ -425,11 +428,13 @@ static int gap_event(struct ble_gap_event* event, void* arg) {
         }
         break;
     case BLE_GAP_EVENT_DISCONNECT:
+        openair_sim_on_gap_event(event);
         ESP_LOGI(TAG, "GAP disconnect reason=0x%02x", event->disconnect.reason);
         s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
         advertise();
         break;
     case BLE_GAP_EVENT_SUBSCRIBE:
+        openair_sim_on_gap_event(event);   // seeds A/C telemetry on its notify
         ESP_LOGI(TAG, "subscribe attr=%u notify=%d",
                  event->subscribe.attr_handle, event->subscribe.cur_notify);
         break;
@@ -494,7 +499,8 @@ static void on_reset(int reason) {
 // P4 scan window each payload is always present at least once.
 static void updater_task(void* arg) {
     (void)arg;
-    int adv_phase = 0;   // 0=solar, 1=bthome, 2=multiplus
+    int adv_phase = 0;   // 0=solar, 1=bthome, 2=multiplus, 3=openair
+    int tick_div  = 0;   // paces A/C telemetry to ~2 s across 250 ms loops
     while (1) {
 #ifdef OPENAIR_SIM
         openair_sim_tick();
@@ -521,7 +527,8 @@ static void updater_task(void* arg) {
             // 4-phase rotation (Victron / BTHome / Multiplus / OpenAir).
             // All phases advertise as "My OpenAir PLUS" (DEVICE_NAME); the
             // other roles are matched by MAC + ADV mfr/service-data, not name.
-            // 750 ms/phase → 3 s full cycle.
+            // 250 ms/phase → 1 s full cycle, so every P4 5 s scan window sees
+            // all four roles several times — they appear simultaneous.
             switch (adv_phase) {
             case 0: update_adv_data();           update_scan_rsp();        break;
             case 1: s_tankSeq++; update_adv_data_bthome(); update_scan_rsp(); break;
@@ -529,8 +536,12 @@ static void updater_task(void* arg) {
             case 3: update_adv_data_openair();   update_scan_rsp_openair(); break;
             }
             adv_phase = (adv_phase + 1) % 4;
+        } else {
+            // A central is connected (advertising paused): keep the A/C
+            // telemetry notifications flowing at ~2 s if it subscribed.
+            if (++tick_div >= 8) { tick_div = 0; openair_sim_tick(); }
         }
-        vTaskDelay(pdMS_TO_TICKS(750));
+        vTaskDelay(pdMS_TO_TICKS(250));
     }
 }
 
@@ -758,8 +769,13 @@ void app_main(void) {
 #ifdef OPENAIR_SIM
     openair_sim_register_gatt();
 #else
+    // Default "full rig": offer the Ultimatron BMS GATT (0xFF00) AND the A/C
+    // GATT (e43ff2c2) on one device, so the P4 can connect to either while the
+    // advertising rotation feeds the passive Victron/BTHome/Multiplus roles.
+    // NimBLE accumulates services across count_cfg/add_svcs calls before start.
     ble_gatts_count_cfg(gatt_svcs);
     ble_gatts_add_svcs(gatt_svcs);
+    openair_sim_register_gatt();
 #endif
 
     usb_serial_jtag_driver_config_t ucfg = USB_SERIAL_JTAG_DRIVER_CONFIG_DEFAULT();

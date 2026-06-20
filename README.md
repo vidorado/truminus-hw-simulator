@@ -14,21 +14,22 @@ single device. Useful for developing and testing the
 | Ultimatron BMS | BLE GATT | Service `0xFF00`, characteristic `0xFF01` (notify) / `0xFF02` (write). Responds to the JBD `DD A5 03 00 FF FD 77` query. |
 | Fresh-water tank | BLE advertising (BTHome v2) | Service Data UUID `0xFCD2`, *Moisture* tag `0x2F` (uint8 0..100 %). Bench value oscillates 25..95 % over ~10 min via `sinf()`. |
 | Victron Multiplus (VE.Bus) | BLE advertising (Instant Readout) | Company ID `0x02E1`, readout type `0x0C`, AES-128-CTR. |
-| OpenAir PLUS A/C | BLE advertising (name only) | Advertises as **`My OpenAir PLUS`** with the A/C service UUID so the P4 lists it in the Monitorización scan and switches to the CLIMATIZACIÓN panel. Advertising side only — the full GATT command-capture sim is the `OPENAIR_SIM=1` personality. |
+| OpenAir PLUS A/C | BLE advertising + GATT | Advertises as **`My OpenAir PLUS`** with the A/C service UUID, and serves the A/C GATT (`e43ff2c2`) so the P4 connects, runs the handshake and reads telemetry — the CLIMATIZACIÓN panel populates and the topbar BLE icon goes solid. `OPENAIR_SIM=1` is the dedicated personality for capturing the Android app's command writes in isolation. |
 
 All roles share one BLE identity and one MAC. The Victron mfr-data,
 BTHome service-data, Multiplus mfr-data and OpenAir adv rotate every
-1.5 s on the same legacy advertising channel (6 s full cycle), so any
-≥8 s P4 scan window sees all four. The OpenAir phase swaps the scan-rsp
-name to `My OpenAir PLUS`; the other three keep `TruMinus-BLESim`. When a
-central connects to read Ultimatron, legacy advertising pauses and
-resumes on disconnect — the P4 polls Ultimatron once every ~30 s, so the
-gap is harmless.
+250 ms on the same legacy advertising channel (1 s full cycle), so any
+P4 5 s scan window sees all four roles several times — they appear
+simultaneous. The OpenAir phase swaps the scan-rsp name to `My OpenAir
+PLUS`; the other three keep `TruMinus-BLESim`. The device serves both the
+Ultimatron BMS GATT (`0xFF00`) and the A/C GATT (`e43ff2c2`): when a
+central connects to either, legacy advertising pauses and resumes on
+disconnect — the P4 polls each once per cycle, so the gap is harmless.
 
 > To pair the A/C in the P4: **Monitorización → AC OpenAIR Plus Bergstrom →
 > 🔍** and pick `My OpenAir PLUS` (its MAC is the same as the sim's). That
-> flips CALEFACCIÓN → CLIMATIZACIÓN. (UI-only for now; the P4 has no A/C
-> BLE driver yet, so no command/telemetry exchange happens.)
+> flips CALEFACCIÓN → CLIMATIZACIÓN and the P4 then connects to read A/C
+> telemetry over GATT.
 
 ## Hardware
 
